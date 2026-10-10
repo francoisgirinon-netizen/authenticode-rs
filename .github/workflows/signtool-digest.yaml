@@ -1,0 +1,74 @@
+# Compare the Authenticode digest computed by SignTool for unsigned PE files
+# whose size is not a multiple of 8 bytes with the digest of this crate.
+
+on:
+  push:
+    branches:
+      - ci/signtool-digest
+  workflow_dispatch:
+
+name: SignTool digest
+
+jobs:
+  signtool-digest:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ci/digest-check -> target
+
+      - name: Build digest-check
+        run: cargo build --release --manifest-path ci/digest-check/Cargo.toml
+
+      - name: Prepare unsigned test files (size not a multiple of 8)
+        run: |
+          New-Item -ItemType Directory -Force work, work/dg | Out-Null
+          # tiny64.efi from the test data with 3 bytes appended
+          $b = [IO.File]::ReadAllBytes("authenticode/tests/testdata/tiny64.efi")
+          [IO.File]::WriteAllBytes("work/tiny64_3.efi", $b + [byte[]](1, 2, 3))
+          # a Windows executable without embedded signature, with 3 bytes appended (like an installer overlay)
+          python -c @"
+          import glob, struct
+          for p in sorted(glob.glob(r'C:\Windows\System32\*.exe')):
+              d = open(p, 'rb').read()
+              pe = struct.unpack_from('<I', d, 0x3c)[0]; opt = pe + 24
+              magic = struct.unpack_from('<H', d, opt)[0]
+              cert = opt + (96 if magic == 0x10b else 112) + 32
+              if magic == 0x20b and struct.unpack_from('<I', d, cert + 4)[0] == 0 and len(d) < 2_000_000:
+                  open('work/system_3.exe', 'wb').write(d + bytes([1, 2, 3]))
+                  print('source:', p, len(d))
+                  break
+          "@
+          Get-ChildItem work -File | Format-Table Name, Length
+
+      - name: Create a self-signed code signing certificate
+        run: |
+          $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject "CN=SignTool digest test" -CertStoreLocation Cert:\CurrentUser\My
+          $pw = ConvertTo-SecureString -String "test" -Force -AsPlainText
+          Export-PfxCertificate -Cert $cert -FilePath work/cert.pfx -Password $pw | Out-Null
+
+      - name: Compare digests
+        run: |
+          $signtool = (Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" | Sort-Object FullName | Select-Object -Last 1).FullName
+          Write-Output "signtool: $signtool"
+          $summary = @("| file | size mod 8 | without padding | with padding | signtool /dg | signtool sign | authenticode-rs (this branch) |", "|---|---|---|---|---|---|---|")
+          foreach ($f in (Get-ChildItem -Path work/* -Include *.efi, *.exe -File).Name) {
+            $in = "work/$f"
+            $h = python ci/signtool_digest.py hash $in | ConvertFrom-StringData
+            & $signtool sign /dg work/dg /fd SHA256 /f work/cert.pfx /p test $in
+            if ($LASTEXITCODE -ne 0) { throw "signtool /dg failed for $f" }
+            $dg = (python ci/signtool_digest.py stored "work/dg/$f.p7u" | ConvertFrom-StringData).stored
+            Copy-Item $in "work/signed_$f"
+            & $signtool sign /fd SHA256 /f work/cert.pfx /p test "work/signed_$f"
+            if ($LASTEXITCODE -ne 0) { throw "signtool sign failed for $f" }
+            $signed = (python ci/signtool_digest.py stored "work/signed_$f" | ConvertFrom-StringData).stored
+            $rs = (& ci/digest-check/target/release/digest-check.exe $in | ConvertFrom-StringData).authenticode_rs
+            $summary += "| $f | $($h.mod8) | $($h.no_padding) | $($h.padding) | $dg | $signed | $rs |"
+          }
+          $summary | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+          $summary | Write-Output

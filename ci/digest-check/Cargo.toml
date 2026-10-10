@@ -1,0 +1,14 @@
+# Standalone helper for the signtool-digest workflow: prints the authenticode
+# SHA-256 digest computed by this crate.
+[package]
+name = "digest-check"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+authenticode = { path = "../../authenticode", features = ["object"] }
+object = { version = "0.39.0", default-features = false, features = ["pe", "read_core", "unaligned"] }
+sha2 = "0.11.0"
